@@ -135,14 +135,19 @@ DATABASE_URL=postgres://... \
 The `events` table is enormous, so the Transfer scan is **never** run in one shot: it walks the block range in bounded
 chunks (`--chunk`), aggregates each chunk server-side (`GROUP BY address`), and merges per-address flags in memory (the
 distinct-token count is small even though raw Transfer rows number in the billions). Every connection sets a
-`statement_timeout` so a runaway chunk is aborted, the pool is capped at 2 connections, and queries run sequentially.
-The bridged-set queries run once over all history but are index-selective (`topic1`/`topic2`), not full scans.
+`statement_timeout`, the pool is capped at 2 connections, and queries run sequentially. A chunk that **does** hit the
+timeout is automatically halved and retried (down to `--min-chunk`), so the scan self-tunes to local event density
+instead of dying on a dense window. The bridged-set queries run once over all history but are index-selective — the
+NTV-deploy lookup is pinned to the `topic2` index via a `MATERIALIZED` CTE so the planner can't fall back to scanning
+every `DEPLOY` event.
 
 Flags:
 
 - `--from-block`/`--to-block`/`--last` — block range for the Transfer scan (default: full history).
 - `--chunk N` — blocks per query (default 100000); lower it if chunks are too heavy.
-- `--statement-timeout-secs N` — per-query timeout (default 300; 0 disables).
+- `--min-chunk N` — floor the auto-splitter shrinks to (default 1000); below it the run errors instead of looping.
+- `--statement-timeout-secs N` — per-query timeout (default 300; 0 disables). Raise this if you hit the `--min-chunk`
+  floor or a bridged-set query times out.
 - `--top N` — candidates to print, ranked by transfer count (default 100).
 - `--csv PATH` — write all candidates (`address,transfers,in_tokens_table,symbol`).
 

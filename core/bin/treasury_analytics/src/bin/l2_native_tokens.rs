@@ -40,7 +40,7 @@
 //!   DATABASE_URL=postgres://... \
 //!   cargo run --release --bin l2_native_tokens -- --top 100 --csv candidates.csv
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -77,8 +77,14 @@ struct Args {
     /// still too heavy.
     #[arg(long, default_value_t = 100_000)]
     chunk: u32,
-    /// Per-query statement timeout (seconds). A chunk that exceeds this is aborted instead
-    /// of grinding indefinitely. Set 0 to disable.
+    /// Smallest chunk (in blocks) the adaptive splitter will shrink to. A chunk that times
+    /// out is halved and retried down to this floor; below it the run errors out so a single
+    /// pathological block can't loop forever. Raise `--statement-timeout-secs` instead if you
+    /// hit the floor.
+    #[arg(long, default_value_t = 1_000)]
+    min_chunk: u32,
+    /// Per-query statement timeout (seconds). A chunk that exceeds this is split and retried
+    /// (see `--min-chunk`) rather than aborting the run. Set 0 to disable.
     #[arg(long, default_value_t = 300)]
     statement_timeout_secs: u64,
     /// How many candidates to print (ranked by transfer count).
@@ -109,6 +115,12 @@ fn address_topic(addr: &Address) -> [u8; 32] {
 /// Extract a 20-byte address from a 32-byte (left-padded) topic / address column.
 fn addr_from_bytes(bytes: &[u8]) -> Address {
     Address::from_slice(&bytes[bytes.len().saturating_sub(20)..])
+}
+
+/// Postgres SQLSTATE `57014` (`query_canceled`) — what a `statement_timeout` raises.
+/// Used to drive adaptive chunk-splitting instead of aborting the whole run.
+fn is_statement_timeout(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db) if db.code().as_deref() == Some("57014"))
 }
 
 #[tokio::main]
@@ -183,12 +195,15 @@ async fn main() -> anyhow::Result<()> {
 
     // (a) Tokens whose beacon proxy was deployed by the L2NativeTokenVault. The
     // ContractDeployer DEPLOY event records the deployer (msg.sender) in topic2 and the
-    // deployed address in topic4. `topic2 = NTV` is highly selective via events_topic2_idx.
+    // deployed address in topic4. `topic2 = NTV` is rare and highly selective, so we pin the
+    // plan to events_topic2_idx with a MATERIALIZED CTE — otherwise the planner may instead
+    // scan every DEPLOY event (topic1) on a huge chain and time out.
     let rows = sqlx::query(
         r#"
-        SELECT DISTINCT topic4
-        FROM events
-        WHERE topic1 = $1 AND address = $2 AND topic2 = $3
+        WITH ntv_events AS MATERIALIZED (
+            SELECT topic1, address, topic4 FROM events WHERE topic2 = $3
+        )
+        SELECT DISTINCT topic4 FROM ntv_events WHERE topic1 = $1 AND address = $2
         "#,
     )
     .bind(DEPLOY_EVENT_SIGNATURE.as_slice())
@@ -196,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
     .bind(ntv_topic.as_slice())
     .fetch_all(&pool)
     .await
-    .context("NTV-deployed-tokens query failed")?;
+    .context("NTV-deployed-tokens query failed (try raising --statement-timeout-secs)")?;
     for row in &rows {
         let t: Vec<u8> = row.try_get("topic4")?;
         bridged.insert(addr_from_bytes(&t));
@@ -215,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
     .bind(bridge_init_old.as_bytes())
     .fetch_all(&pool)
     .await
-    .context("bridge-init query failed")?;
+    .context("bridge-init query failed (try raising --statement-timeout-secs)")?;
     for row in &rows {
         let a: Vec<u8> = row.try_get("address")?;
         bridged.insert(addr_from_bytes(&a));
@@ -241,18 +256,30 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- Phase 2: harvest ERC20-shaped Transfer emitters, chunked over the block range. ----
     eprintln!(
-        "Scanning Transfer events for blocks {from_block}..={to_block} in chunks of {} blocks...",
-        args.chunk
+        "Scanning Transfer events for blocks {from_block}..={to_block} in chunks of {} blocks \
+         (auto-splitting on timeout, floor {} blocks)...",
+        args.chunk, args.min_chunk
     );
     let mut agg: HashMap<Address, Agg> = HashMap::new();
 
+    // Worklist of [start, end] block ranges to scan, processed front-to-back. A chunk that
+    // hits the statement timeout is halved and its two halves are pushed back to the front,
+    // so the scan self-tunes to local event density instead of dying on a dense window.
+    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
     let mut start = from_block;
     loop {
         let end = start.saturating_add(args.chunk - 1).min(to_block);
+        queue.push_back((start, end));
+        if end == to_block {
+            break;
+        }
+        start = end.saturating_add(1);
+    }
 
+    while let Some((start, end)) = queue.pop_front() {
         // One bounded, server-side aggregation per chunk: for each emitting contract, did
         // it ever look ERC20 (empty topic4) and/or ERC721 (non-empty topic4) in this range.
-        let rows = sqlx::query(
+        let result = sqlx::query(
             r#"
             SELECT
                 address,
@@ -269,8 +296,31 @@ async fn main() -> anyhow::Result<()> {
         .bind(i64::from(start))
         .bind(i64::from(end))
         .fetch_all(&pool)
-        .await
-        .with_context(|| format!("Transfer scan failed for blocks {start}..={end}"))?;
+        .await;
+
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(err) if is_statement_timeout(&err) && (end - start + 1) > args.min_chunk => {
+                let mid = start + (end - start) / 2;
+                eprintln!(
+                    "  chunk {start}..={end} timed out; splitting into {start}..={mid} and {}..={end}",
+                    mid + 1
+                );
+                // Retry the halves before advancing past this region.
+                queue.push_front((mid + 1, end));
+                queue.push_front((start, mid));
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Transfer scan failed for blocks {start}..={end} (chunk already at/below \
+                         --min-chunk {}; raise --statement-timeout-secs)",
+                        args.min_chunk
+                    )
+                });
+            }
+        };
 
         for row in &rows {
             let addr = addr_from_bytes(&row.try_get::<Vec<u8>, _>("address")?);
@@ -291,11 +341,6 @@ async fn main() -> anyhow::Result<()> {
             "  ..{end}: {} distinct transfer-emitting contracts so far",
             agg.len()
         );
-
-        if end == to_block {
-            break;
-        }
-        start = end.saturating_add(1);
     }
 
     // ---- Classify ----
