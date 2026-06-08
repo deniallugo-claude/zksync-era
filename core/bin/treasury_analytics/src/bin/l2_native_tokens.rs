@@ -40,7 +40,10 @@
 //!   DATABASE_URL=postgres://... \
 //!   cargo run --release --bin l2_native_tokens -- --top 100 --csv candidates.csv
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -93,6 +96,13 @@ struct Args {
     /// Write all candidates to this CSV (`address,transfers,in_tokens_table,symbol`).
     #[arg(long)]
     csv: Option<String>,
+    /// Checkpoint the (long) Transfer scan under this directory so it can be interrupted
+    /// (Ctrl-C, OOM, timeout floor) and resumed. The block window is pinned in `meta.txt` on
+    /// the first run and reused on resume, so the snapshot stays consistent as the chain
+    /// advances; per-chunk aggregates are appended (and fsynced) with a block-watermark
+    /// cursor. Omit to disable caching.
+    #[arg(long)]
+    cache_dir: Option<String>,
 }
 
 /// Per-contract accumulator merged across chunks.
@@ -153,11 +163,36 @@ async fn main() -> anyhow::Result<()> {
                 .context("no miniblocks in DB")? as u32
         }
     };
-    let from_block = match (args.from_block, args.last) {
+    let mut from_block = match (args.from_block, args.last) {
         (Some(f), _) => f,
         (None, Some(last)) => to_block.saturating_sub(last.saturating_sub(1)),
         (None, None) => 0,
     };
+    let mut to_block = to_block;
+
+    // Set up the optional resume cache and pin the block window. On a fresh cache we record
+    // the window; on resume we reuse the pinned window so the snapshot stays consistent even
+    // as the chain advances (the CLI range is ignored, with a warning if it differs).
+    let cache = args.cache_dir.as_deref().map(Cache::new);
+    if let Some(cache) = &cache {
+        cache.init().context("failed to create --cache-dir")?;
+        match cache.load_meta()? {
+            Some(meta) => {
+                if (from_block, to_block) != (meta.from_block, meta.to_block) {
+                    eprintln!(
+                        "Note: reusing pinned window {}..={} from cache (CLI asked for {from_block}..={to_block}).",
+                        meta.from_block, meta.to_block
+                    );
+                }
+                from_block = meta.from_block;
+                to_block = meta.to_block;
+            }
+            None => cache.save_meta(&Meta {
+                from_block,
+                to_block,
+            })?,
+        }
+    }
 
     // Event signatures (the topic1 values we filter on).
     let transfer_sig = ethabi::long_signature(
@@ -255,25 +290,53 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- Phase 2: harvest ERC20-shaped Transfer emitters, chunked over the block range. ----
-    eprintln!(
-        "Scanning Transfer events for blocks {from_block}..={to_block} in chunks of {} blocks \
-         (auto-splitting on timeout, floor {} blocks)...",
-        args.chunk, args.min_chunk
-    );
+    // The completed work is always a contiguous prefix [from_block, watermark] (the worklist
+    // is processed strictly ascending, splits included), so a single block watermark resumes
+    // the scan. Aggregates already merged into `agg` come from the cache; the in-flight chunk
+    // (start >= resume_from) is intentionally not reloaded and is simply re-scanned.
     let mut agg: HashMap<Address, Agg> = HashMap::new();
+    let mut resume_from = from_block;
+    if let Some(cache) = &cache {
+        let cursor = read_cursor(&cache.agg_cursor) as u32;
+        if cursor > from_block {
+            resume_from = cursor.min(to_block.saturating_add(1));
+        }
+        // Drop any rows past the committed watermark (a crashed chunk's partial/torn append)
+        // so re-scanning can't overlap them — keeps resume correct even if `--chunk` changed.
+        compact_agg(&cache.agg, resume_from)?;
+        agg = load_agg(&cache.agg, resume_from)?;
+        if resume_from > from_block {
+            eprintln!(
+                "Resuming Transfer scan at block {resume_from} ({} contracts loaded from cache).",
+                agg.len()
+            );
+        }
+    }
+
+    if resume_from > to_block {
+        eprintln!("Transfer scan already complete in cache; classifying.");
+    } else {
+        eprintln!(
+            "Scanning Transfer events for blocks {resume_from}..={to_block} in chunks of {} blocks \
+             (auto-splitting on timeout, floor {} blocks)...",
+            args.chunk, args.min_chunk
+        );
+    }
 
     // Worklist of [start, end] block ranges to scan, processed front-to-back. A chunk that
     // hits the statement timeout is halved and its two halves are pushed back to the front,
     // so the scan self-tunes to local event density instead of dying on a dense window.
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
-    let mut start = from_block;
-    loop {
-        let end = start.saturating_add(args.chunk - 1).min(to_block);
-        queue.push_back((start, end));
-        if end == to_block {
-            break;
+    if resume_from <= to_block {
+        let mut start = resume_from;
+        loop {
+            let end = start.saturating_add(args.chunk - 1).min(to_block);
+            queue.push_back((start, end));
+            if end == to_block {
+                break;
+            }
+            start = end.saturating_add(1);
         }
-        start = end.saturating_add(1);
     }
 
     while let Some((start, end)) = queue.pop_front() {
@@ -322,6 +385,10 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        // Each row is tagged with its `start,end` chunk in the cache file so that if a crash
+        // re-runs this exact chunk on resume, the duplicate lines dedupe (last wins) instead
+        // of double-counting the additive transfer totals.
+        let mut body = String::new();
         for row in &rows {
             let addr = addr_from_bytes(&row.try_get::<Vec<u8>, _>("address")?);
             let cnt = row.try_get::<i64, _>("cnt")? as u64;
@@ -335,6 +402,18 @@ async fn main() -> anyhow::Result<()> {
             e.transfers += cnt;
             e.erc20_like |= e20;
             e.erc721_like |= e721;
+            if cache.is_some() {
+                body.push_str(&format!(
+                    "{start},{end},{addr:?},{cnt},{},{}\n",
+                    e20 as u8, e721 as u8
+                ));
+            }
+        }
+        // Persist the chunk, then advance the watermark — never the other way round, so a
+        // crash re-does at most this one chunk and never skips a region.
+        if let Some(cache) = &cache {
+            append(&cache.agg, &body)?;
+            write_cursor(&cache.agg_cursor, (end as usize) + 1)?;
         }
 
         eprintln!(
@@ -421,4 +500,247 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The pinned block window, persisted so resumes scan the same range as the chain advances.
+struct Meta {
+    from_block: u32,
+    to_block: u32,
+}
+
+/// `--cache-dir` layout for the resumable Transfer scan: a pinned window (`meta.txt`), an
+/// append-only per-chunk aggregate file (`transfer_agg.csv`, lines
+/// `start,end,address,transfers,erc20,erc721`), and a block-watermark cursor
+/// (`transfer_agg.cursor`, the next block to scan). The cursor is advanced only *after* the
+/// chunk's rows are fsynced, so a crash re-does at most one chunk; the duplicate rows that
+/// produces are tagged with their `start,end` chunk and deduped on load.
+struct Cache {
+    dir: PathBuf,
+    meta: PathBuf,
+    agg: PathBuf,
+    agg_cursor: PathBuf,
+}
+
+impl Cache {
+    fn new(dir: &str) -> Self {
+        let dir = PathBuf::from(dir);
+        Cache {
+            meta: dir.join("meta.txt"),
+            agg: dir.join("transfer_agg.csv"),
+            agg_cursor: dir.join("transfer_agg.cursor"),
+            dir,
+        }
+    }
+
+    fn init(&self) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("failed to create {}", self.dir.display()))?;
+        Ok(())
+    }
+
+    fn load_meta(&self) -> anyhow::Result<Option<Meta>> {
+        if !self.meta.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&self.meta)
+            .with_context(|| format!("failed to read {}", self.meta.display()))?;
+        let mut from_block = None;
+        let mut to_block = None;
+        for line in text.lines() {
+            if let Some(v) = line.trim().strip_prefix("from_block=") {
+                from_block = v.trim().parse().ok();
+            } else if let Some(v) = line.trim().strip_prefix("to_block=") {
+                to_block = v.trim().parse().ok();
+            }
+        }
+        match (from_block, to_block) {
+            (Some(from_block), Some(to_block)) => Ok(Some(Meta {
+                from_block,
+                to_block,
+            })),
+            _ => anyhow::bail!("malformed {}", self.meta.display()),
+        }
+    }
+
+    fn save_meta(&self, m: &Meta) -> anyhow::Result<()> {
+        let body = format!("from_block={}\nto_block={}\n", m.from_block, m.to_block);
+        write_atomic(&self.meta, body.as_bytes())
+    }
+}
+
+/// Loads the cached per-chunk aggregates and folds them into a per-address tally. Rows from
+/// the in-flight chunk (`start >= resume_from`, i.e. not yet committed by the cursor) are
+/// skipped — they will be re-scanned — which also discards any torn final line from a crash.
+/// Committed chunks are deduped by `(start, end, address)` (last wins) so a re-appended chunk
+/// never double-counts the additive transfer totals.
+fn load_agg(path: &Path, resume_from: u32) -> anyhow::Result<HashMap<Address, Agg>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut rows: HashMap<(u32, u32, Address), (u64, bool, bool)> = HashMap::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let mut it = line.split(',');
+        let parsed = (|| {
+            let start: u32 = it.next()?.parse().ok()?;
+            let end: u32 = it.next()?.parse().ok()?;
+            let addr = parse_address(it.next()?).ok()?;
+            let transfers: u64 = it.next()?.parse().ok()?;
+            let e20: u8 = it.next()?.parse().ok()?;
+            let e721: u8 = it.next()?.parse().ok()?;
+            Some((start, end, addr, transfers, e20 != 0, e721 != 0))
+        })();
+        // A line that fails to parse can only be a torn write at the tail of the in-flight
+        // chunk (committed chunks are fsynced whole before the cursor advances), so skip it.
+        if let Some((start, end, addr, transfers, e20, e721)) = parsed {
+            if start < resume_from {
+                rows.insert((start, end, addr), (transfers, e20, e721));
+            }
+        }
+    }
+    let mut agg: HashMap<Address, Agg> = HashMap::new();
+    for ((_, _, addr), (transfers, e20, e721)) in rows {
+        let e = agg.entry(addr).or_default();
+        e.transfers += transfers;
+        e.erc20_like |= e20;
+        e.erc721_like |= e721;
+    }
+    Ok(agg)
+}
+
+/// Rewrites the aggregate file keeping only rows committed below `resume_from` (`start <
+/// resume_from`), discarding a crashed chunk's uncommitted or torn-tail rows. Idempotent and
+/// atomic; a no-op when the file is absent.
+fn compact_agg(path: &Path, resume_from: u32) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut kept = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let start: Option<u32> = trimmed.split(',').next().and_then(|s| s.parse().ok());
+        if start.is_some_and(|s| s < resume_from) {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    write_atomic(path, kept.as_bytes())
+}
+
+/// Parses a `0x`-prefixed 20-byte hex address.
+fn parse_address(s: &str) -> anyhow::Result<Address> {
+    let s = s.trim();
+    let hexs = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(hexs).with_context(|| format!("invalid hex address: {s}"))?;
+    anyhow::ensure!(bytes.len() == 20, "address must be 20 bytes: {s}");
+    Ok(Address::from_slice(&bytes))
+}
+
+/// Reads a cursor counter; 0 if the file is missing or unparsable.
+fn read_cursor(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_cursor(path: &Path, n: usize) -> anyhow::Result<()> {
+    write_atomic(path, n.to_string().as_bytes())
+}
+
+/// Appends `body` to `path` (creating it), then fsyncs so the bytes are durable before the
+/// caller advances its cursor.
+fn append(path: &Path, body: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    if body.is_empty() {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {} for append", path.display()))?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()
+        .with_context(|| format!("failed to fsync {}", path.display()))?;
+    Ok(())
+}
+
+/// Writes `bytes` to `path` via a sibling temp file + rename (atomic on the same filesystem),
+/// so readers only ever see a fully-written file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut w = std::fs::File::create(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        w.write_all(bytes)?;
+        w.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("l2_native_tokens_test_{name}.csv"))
+    }
+
+    const A: &str = "0x0000000000000000000000000000000000000001";
+    const B: &str = "0x0000000000000000000000000000000000000002";
+
+    #[test]
+    fn load_agg_sums_across_chunks_and_dedupes_rerun() {
+        let path = tmp("sums");
+        // Two committed chunks, plus chunk [0,99] re-appended after a crash (duplicate).
+        let body = format!("0,99,{A},10,1,0\n100,199,{A},5,1,0\n0,99,{B},7,0,1\n0,99,{A},10,1,0\n");
+        write_atomic(&path, body.as_bytes()).unwrap();
+
+        let agg = load_agg(&path, 200).unwrap();
+        let a = agg.get(&parse_address(A).unwrap()).unwrap();
+        // 10 (chunk 0-99, deduped to one copy) + 5 (chunk 100-199) — NOT 25.
+        assert_eq!(a.transfers, 15);
+        assert!(a.erc20_like && !a.erc721_like);
+        let b = agg.get(&parse_address(B).unwrap()).unwrap();
+        assert_eq!(b.transfers, 7);
+        assert!(b.erc721_like && !b.erc20_like);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_agg_skips_uncommitted_in_flight_chunk() {
+        let path = tmp("inflight");
+        // Committed chunk 0-99, plus an in-flight chunk at the watermark (start == resume_from).
+        let body = format!("0,99,{A},10,1,0\n100,199,{A},99,1,0\n");
+        write_atomic(&path, body.as_bytes()).unwrap();
+
+        let agg = load_agg(&path, 100).unwrap();
+        // Only the committed chunk counts; the in-flight 99 is excluded (will be re-scanned).
+        assert_eq!(agg.get(&parse_address(A).unwrap()).unwrap().transfers, 10);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn compact_drops_rows_at_or_above_watermark() {
+        let path = tmp("compact");
+        let body = format!("0,99,{A},10,1,0\n100,199,{A},99,1,0\nGARBAGE_TORN_LINE\n");
+        write_atomic(&path, body.as_bytes()).unwrap();
+
+        compact_agg(&path, 100).unwrap();
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(kept.contains("0,99"));
+        assert!(!kept.contains("100,199")); // dropped: start >= watermark
+        assert!(!kept.contains("GARBAGE")); // dropped: unparsable start
+        std::fs::remove_file(&path).ok();
+    }
 }

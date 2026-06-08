@@ -141,6 +141,22 @@ instead of dying on a dense window. The bridged-set queries run once over all hi
 NTV-deploy lookup is pinned to the `topic2` index via a `MATERIALIZED` CTE so the planner can't fall back to scanning
 every `DEPLOY` event.
 
+On a large chain the full-history scan is long, so it can checkpoint to disk and resume:
+
+- `--cache-dir DIR` — persist progress under `DIR`. The block window is pinned in `meta.txt` on the first run and reused
+  on every resume (so the snapshot stays consistent as the chain advances; the CLI range is ignored on resume, with a
+  warning if it differs). Each completed chunk's per-address aggregate is appended to `transfer_agg.csv` (and fsynced)
+  before a block-watermark cursor (`transfer_agg.cursor`) advances, so a stop at any moment (Ctrl-C, OOM, timeout floor)
+  re-does at most the last in-flight chunk. Per-chunk rows are tagged with their `start,end` block range, so a re-run
+  dedupes them on load instead of double-counting the additive transfer totals; uncommitted/torn rows past the watermark
+  are compacted away on resume (safe even if `--chunk` changed). Delete the dir to start over. Phase 1 (the bridged set)
+  is cheap and always recomputed.
+
+```bash
+DATABASE_URL=postgres://... \
+./target/release/l2_native_tokens --cache-dir ./l2-native-cache --csv candidates.csv
+```
+
 Flags:
 
 - `--from-block`/`--to-block`/`--last` — block range for the Transfer scan (default: full history).
@@ -148,6 +164,7 @@ Flags:
 - `--min-chunk N` — floor the auto-splitter shrinks to (default 1000); below it the run errors instead of looping.
 - `--statement-timeout-secs N` — per-query timeout (default 300; 0 disables). Raise this if you hit the `--min-chunk`
   floor or a bridged-set query times out.
+- `--cache-dir DIR` — checkpoint/resume the Transfer scan (see above).
 - `--top N` — candidates to print, ranked by transfer count (default 100).
 - `--csv PATH` — write all candidates (`address,transfers,in_tokens_table,symbol`).
 
